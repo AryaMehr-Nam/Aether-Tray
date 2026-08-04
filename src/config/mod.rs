@@ -112,15 +112,32 @@ impl Config {
         Ok(config_dir()?.join("aether-tray.log"))
     }
 
-    /// Where Aether itself runs. Must stay stable across launches: the core
-    /// writes its provisioned identity (`aether-masque.toml` / `aether.toml`)
-    /// into its working directory, so a changing cwd silently re-provisions
-    /// the WARP identity every run.
-    pub fn data_dir() -> Result<PathBuf> {
+    /// The core's working directory. Must stay stable across launches — and
+    /// must keep pointing at the windowed app's directory when that exists,
+    /// because the core writes its provisioned identity
+    /// (`aether-masque.toml` / `aether.toml`) into its cwd. Moving it would
+    /// silently re-provision every upgrading user's WARP identity.
+    ///
+    /// Deliberately NOT where our pid file goes: this directory is shared
+    /// with the other app, so anything we write here we do not own. See
+    /// `state_dir`.
+    pub fn core_cwd() -> Result<PathBuf> {
         match legacy_data_dir().filter(|d| d.exists()) {
             Some(dir) => Ok(dir),
             None => config_dir(),
         }
+    }
+
+    /// Our own state, never shared. The pid file lives here rather than in
+    /// `core_cwd` so that orphan reaping can only ever kill a core *this*
+    /// app started: the windowed app keeps its own `aether.pid` in the
+    /// shared directory, and treating that as ours would SIGKILL a
+    /// perfectly healthy connection belonging to another process.
+    ///
+    /// The two apps are expected to coexist; a genuine clash surfaces as a
+    /// normal port-in-use error from `start_connect`.
+    pub fn state_dir() -> Result<PathBuf> {
+        config_dir()
     }
 }
 
@@ -348,5 +365,27 @@ mod tests {
         std::fs::write(dir.path().join(LEGACY_PROFILE_STORE), "{not json").unwrap();
         let cfg = migrate_from_dir(dir.path()).unwrap().expect("migrated");
         assert_eq!(cfg.profile, ConnectionProfile::default());
+    }
+
+    #[test]
+    fn pid_file_never_lands_in_the_shared_core_directory() {
+        // Regression guard: the core's cwd is shared with the windowed app,
+        // which keeps its OWN aether.pid there. If state_dir ever resolves to
+        // the same place, orphan reaping would read that foreign pid and
+        // SIGKILL a healthy connection belonging to the other app.
+        let state = Config::state_dir().unwrap();
+        if let Some(legacy) = legacy_data_dir() {
+            assert_ne!(
+                state, legacy,
+                "state_dir must not be the legacy/shared directory"
+            );
+        }
+        // And when the legacy directory exists, core_cwd must still prefer it
+        // so the provisioned WARP identity is not orphaned.
+        let cwd = Config::core_cwd().unwrap();
+        match legacy_data_dir().filter(|d| d.exists()) {
+            Some(legacy) => assert_eq!(cwd, legacy),
+            None => assert_eq!(cwd, state),
+        }
     }
 }

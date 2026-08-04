@@ -12,6 +12,8 @@ use anyhow::Result;
 use log::{error, warn};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -57,6 +59,7 @@ pub fn run() -> Result<()> {
             .ok()
             .and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok()),
         code_prompt_open: false,
+        interrupt: Arc::new(AtomicBool::new(false)),
         config,
     };
 
@@ -76,6 +79,16 @@ pub fn run() -> Result<()> {
         );
     }
 
+    // A tray app is normally quit from its menu, but it can still be started
+    // from a shell or stopped by a service manager. Without this, Ctrl-C would
+    // kill us while the core kept running and holding the SOCKS port.
+    {
+        let interrupt = Arc::clone(&app.interrupt);
+        if let Err(e) = ctrlc::set_handler(move || interrupt.store(true, Ordering::Relaxed)) {
+            warn!("could not install the Ctrl-C handler: {e}");
+        }
+    }
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     event_loop.run_app(&mut app)?;
@@ -92,6 +105,9 @@ struct TrayApp {
     state: ConnectionState,
     log_file: Option<File>,
     code_prompt_open: bool,
+    /// Set from the Ctrl-C handler; polled by the event loop because a signal
+    /// handler must not touch the supervisor or the tray directly.
+    interrupt: Arc<AtomicBool>,
 }
 
 impl TrayApp {
@@ -372,6 +388,32 @@ impl TrayApp {
         self.rebuild_menu();
     }
 
+    /// One iteration of periodic work: drain the supervisor, service menu
+    /// clicks, honour an interrupt, then arm the next wakeup.
+    fn pump(&mut self, event_loop: &ActiveEventLoop) {
+        self.drain_channels();
+
+        // muda delivers menu clicks on its own channel, not through winit.
+        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+            if let Some(action) = menu::action_for(&event.id) {
+                self.handle(action, event_loop);
+            }
+        }
+
+        if self.interrupt.load(Ordering::Relaxed) {
+            // Same path as the Quit menu item, so the core is torn down
+            // rather than left holding the SOCKS port.
+            let _ = self.commands.send(Command::Shutdown);
+            self.supervisor.shutdown_blocking();
+            event_loop.exit();
+            return;
+        }
+
+        // Re-arm on every pass: WaitUntil is a one-shot deadline, so without
+        // this the loop would park indefinitely after the first wakeup.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
+    }
+
     fn copy_proxy_address(&self) {
         let addr = self.config.profile.bind_address.clone();
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(addr)) {
@@ -416,16 +458,16 @@ impl ApplicationHandler for TrayApp {
             }
         }
 
-        self.drain_channels();
+        self.pump(event_loop);
+    }
 
-        // muda delivers menu clicks on its own channel, not through winit.
-        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
-            if let Some(action) = menu::action_for(&event.id) {
-                self.handle(action, event_loop);
-            }
-        }
-
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
+    /// Runs after every batch of events, including the timer wakeups from
+    /// `ControlFlow::WaitUntil`. All periodic work lives here rather than in
+    /// `new_events` so it still happens on an idle desktop: this app owns no
+    /// window, so without a scheduled wakeup the loop would park forever and
+    /// never poll the supervisor channels or the interrupt flag.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.pump(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {

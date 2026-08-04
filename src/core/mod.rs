@@ -122,7 +122,11 @@ pub struct Supervisor {
     status_tx: Sender<StatusEvent>,
     log_tx: Sender<LogEvent>,
     binary: PathBuf,
-    data_dir: PathBuf,
+    /// The core's working directory — shared with the windowed app so the
+    /// provisioned WARP identity persists. We do not own files here.
+    core_cwd: PathBuf,
+    /// Our own state directory; the pid file lives here.
+    state_dir: PathBuf,
 }
 
 /// Everything a caller needs to drive and observe a supervisor.
@@ -140,11 +144,14 @@ impl Supervisor {
     /// command loop as a side effect.
     pub fn start(config: &Config) -> Result<SupervisorHandles> {
         let binary = resolve_binary(config)?;
-        let data_dir = Config::data_dir()?;
-        std::fs::create_dir_all(&data_dir)?;
+        let core_cwd = Config::core_cwd()?;
+        let state_dir = Config::state_dir()?;
+        std::fs::create_dir_all(&core_cwd)?;
+        std::fs::create_dir_all(&state_dir)?;
         // Before anything can bind the SOCKS port, clear a leftover core from
-        // a previous crash.
-        orphan::reap_orphan(&data_dir);
+        // a previous crash of *this* app. Reads only our own state dir, so a
+        // core belonging to the windowed app is never touched.
+        orphan::reap_orphan(&state_dir);
 
         let (status_tx, status_rx) = mpsc::channel();
         let (log_tx, log_rx) = mpsc::channel();
@@ -160,7 +167,8 @@ impl Supervisor {
             status_tx,
             log_tx,
             binary,
-            data_dir,
+            core_cwd,
+            state_dir,
         };
 
         let for_loop = supervisor.clone();
@@ -227,18 +235,30 @@ impl Supervisor {
         {
             let mut inner = self.inner.lock().unwrap();
             if !inner.state.is_resting() {
+                // Deliberately does NOT set Error: there is a live attempt or
+                // connection behind this state, and clobbering it would
+                // report a failure that did not happen.
                 return Err(anyhow!("Aether is already running"));
             }
             // Defensive guard independent of the pid-file mechanism in
-            // orphan.rs (covers a manually-started Aether or a missing pid
-            // file), checked under the same lock as the state check above so
-            // a rapid double-click can't race two connects past this guard.
+            // orphan.rs (covers a manually-started Aether, another app's
+            // core, or a missing pid file), checked under the same lock as
+            // the state check above so a rapid double-click can't race two
+            // connects past this guard.
             let socks = status::parse_bind_address(&profile.bind_address);
             if status::port_is_live(&socks) {
-                return Err(anyhow!(
-                    "port {} is already in use by another process",
-                    socks.port()
-                ));
+                let message = format!("port {} is already in use by another process", socks.port());
+                inner.state = ConnectionState::Error {
+                    message: message.clone(),
+                    phase: "launching".into(),
+                };
+                let new_state = inner.state.clone();
+                drop(inner);
+                // Must reach the UI: the user pressed Connect and it failed,
+                // so leaving the tray on Idle would look like nothing
+                // happened at all.
+                let _ = self.status_tx.send(StatusEvent::StateChange(new_state));
+                return Err(anyhow!(message));
             }
             inner.state = ConnectionState::Launching;
             // A fresh user-initiated connect always gets a full retry budget.
@@ -257,7 +277,7 @@ impl Supervisor {
     fn spawn_and_monitor(&self, profile: ConnectionProfile) -> Result<()> {
         let session = match pty::spawn(
             &self.binary,
-            &self.data_dir,
+            &self.core_cwd,
             profile.clone(),
             self.log_tx.clone(),
         ) {
@@ -275,7 +295,7 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        orphan::write_pid(&self.data_dir, session.pid());
+        orphan::write_pid(&self.state_dir, session.pid());
 
         {
             let mut inner = self.inner.lock().unwrap();
@@ -405,7 +425,7 @@ impl Supervisor {
             inner.retry_count += 1;
             inner.retry_count
         };
-        orphan::clear_pid(&self.data_dir);
+        orphan::clear_pid(&self.state_dir);
 
         if attempt > status::MAX_AUTO_RETRIES {
             self.set_state(ConnectionState::Error {
@@ -478,7 +498,7 @@ impl Supervisor {
                     inner.session = None;
                     inner.user_requested_stop = false;
                     drop(inner);
-                    orphan::clear_pid(&this.data_dir);
+                    orphan::clear_pid(&this.state_dir);
                     this.set_state(ConnectionState::Idle);
                     return;
                 }
@@ -523,7 +543,7 @@ impl Supervisor {
         inner.session = None;
         inner.state = ConnectionState::Idle;
         drop(inner);
-        orphan::clear_pid(&self.data_dir);
+        orphan::clear_pid(&self.state_dir);
     }
 }
 
