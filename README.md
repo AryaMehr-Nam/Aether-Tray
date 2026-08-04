@@ -104,14 +104,15 @@ reaping must never read a pid belonging to another process.
 
 ```
 ./packaging/macos-app.sh            # dist/Aether.app
+./packaging/macos-dmg.sh <app> <dmg>  # drag-and-drop DMG from an existing bundle
 ./packaging/linux-appimage.sh       # dist/Aether-<version>-x86_64.AppImage
 pwsh -File packaging/windows-zip.ps1  # dist/Aether-<version>-x86_64-windows.zip
 ```
 
 Each script bundles the fetched core next to the executable, where the binary
-looks first. CI (`.github/workflows/ci.yml`) runs fmt, clippy and the tests
-across macOS arm64/x86_64, Linux x86_64 and Windows x86_64; tagging `v*` runs
-`release.yml`, which packages all four and opens a draft release.
+looks first. `release.yml` packages macOS arm64/x86_64 (zip + drag-and-drop
+DMG), Linux x86_64/aarch64 (AppImage) and Windows x86_64 (zip) and opens a
+release — either from a `v*` tag or automatically from a push to `main`.
 
 The macOS bundle sets `LSUIElement` and the binary requests
 `NSApplicationActivationPolicyAccessory`, so there is no Dock icon or Cmd-Tab

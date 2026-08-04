@@ -12,20 +12,32 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Don't run two releases for the same ref at once (e.g. a second push to main
+# while the first is still packaging).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   package:
     name: package (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    # A job that can't find a runner (or hangs) should fail loudly instead of
+    # sitting in the queue forever.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
+          # macos-13 was retired by GitHub in Dec 2025, which is why the
+          # x86_64 job was stuck "waiting for a runner". Standard macOS 15
+          # images run on Apple silicon; Intel builds need the -intel label.
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             aether_asset: aether-macos-arm64.tar.gz
           - name: macos-x86_64
-            os: macos-13
+            os: macos-15-intel
             target: x86_64-apple-darwin
             aether_asset: aether-macos-x86_64.tar.gz
           - name: linux-x86_64
@@ -58,37 +70,58 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
-      # Cross-compiling for aarch64 on an x86_64 runner needs the ARM
-      # versions of GTK, the appindicator library, and libxdo.
+      # ── Linux cross-compilation (aarch64 on an x86_64 runner) ──────────
+      # The rules that make this work:
+      #   * amd64 packages come from archive/security.ubuntu.com only.
+      #   * arm64 packages come from ports.ubuntu.com only — the main archive
+      #     servers do NOT carry arm64 (they 404), and neither does
+      #     security.ubuntu.com, so the -security suite must use ports too.
+      #   * Ubuntu 24.04+ runners use DEB822 (.sources) files. Those need an
+      #     explicit "Architectures: amd64" key; some images ship it and some
+      #     don't, so handle both. Without it apt tries to fetch arm64 from
+      #     archive.ubuntu.com and apt-get update dies with 404s.
       - name: Install Linux tray dependencies (cross aarch64)
         if: runner.os == 'Linux' && matrix.cross
         run: |
+          set -euo pipefail
           sudo dpkg --add-architecture arm64
 
-          # Disable ALL third-party sources and restrict to amd64.
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
-          sudo rm -f /etc/apt/sources.list.d/arm64-ports.list
+          # Drop third-party repos (they don't publish arm64) and any previous
+          # ports list so this step is idempotent on re-runs.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/arm64-ports.list
 
-          # Replace DEB822 format (.sources) with amd64-only entries.
+          # DEB822 (.sources): force amd64 — set the key if present, insert it
+          # after each "Types:" line if absent.
           for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] && sudo sed -i 's/^Architectures:.*/Architectures: amd64/' "$f"
+            [ -f "$f" ] || continue
+            if sudo grep -q '^Architectures:' "$f"; then
+              sudo sed -i 's/^Architectures:.*/Architectures: amd64/' "$f"
+            else
+              sudo sed -i '/^Types:/a Architectures: amd64' "$f"
+            fi
           done
-          # Replace traditional format (.list) with amd64-only.
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] && sudo sed -i 's/^deb /deb [arch=amd64] /' "$f"
+
+          # Traditional one-line format: strip any existing arch tag, then tag
+          # every deb line with amd64 (idempotent on images that already tag).
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] || continue
+            sudo sed -i -e 's/^deb \[[^]]*\] /deb /' -e 's/^deb /deb [arch=amd64] /' "$f"
           done
-          # Handle /etc/apt/sources.list if it exists.
-          [ -f /etc/apt/sources.list ] && sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
 
-          # Add arm64 packages from ports.ubuntu.com.
-          # security.ubuntu.com does NOT serve arm64; only ports.ubuntu.com does.
-          UBUNTU_CODENAME=$(lsb_release -cs)
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME-backports main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+          # arm64 packages come from ports.ubuntu.com for ALL suites,
+          # including -security (security.ubuntu.com has no arm64).
+          UBUNTU_CODENAME=$(. /etc/os-release && printf '%s' "$UBUNTU_CODENAME")
+          for suite in "" "-updates" "-security" "-backports"; do
+            echo "deb [arch=arm64] https://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME}${suite} main restricted universe multiverse" \
+              | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list >/dev/null
+          done
 
-          sudo apt-get update
+          # apt is flaky on shared runners: retry and lengthen timeouts.
+          sudo apt-get update \
+            -o Acquire::Retries=5 \
+            -o Acquire::http::Timeout=120 \
+            -o Acquire::https::Timeout=120
           sudo apt-get install -y \
             libgtk-3-dev:arm64 \
             libayatana-appindicator3-dev:arm64 \
@@ -97,10 +130,7 @@ jobs:
             g++-aarch64-linux-gnu
           # Tell Cargo which linker to use for the cross target.
           mkdir -p ~/.cargo
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
-
-
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
 
       # ── Fetch the Aether core ──────────────────────────────────────────
       # AETHER_ASSET pins the core to the *target* arch, not the runner's.
@@ -112,12 +142,7 @@ jobs:
         run: ./binaries/fetch-aether.sh
 
       # ── Build ──────────────────────────────────────────────────────────
-      - name: Build (cross)
-        if: matrix.cross
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Build (native)
-        if: "!matrix.cross"
+      - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # ── Package ────────────────────────────────────────────────────────
@@ -130,6 +155,8 @@ jobs:
           cd dist
           # -y preserves the symlinks inside a .app bundle.
           zip -ry "Aether-${{ matrix.name }}.zip" Aether.app
+          # Drag-and-drop DMG: open it and drop Aether.app onto Applications.
+          ../packaging/macos-dmg.sh Aether.app "Aether-${{ matrix.name }}.dmg"
 
       - name: Package (Linux native)
         if: runner.os == 'Linux' && !matrix.cross
@@ -167,12 +194,14 @@ jobs:
             dist/*.zip
             dist/*.AppImage
             dist/*.app
+            dist/*.dmg
           if-no-files-found: error
 
   # ── Create the release ──────────────────────────────────────────────────
   release:
     needs: package
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -208,7 +237,7 @@ jobs:
         id: files
         run: |
           # Flatten all uploaded artifacts into a single list.
-          find artifacts -type f \( -name '*.zip' -o -name '*.AppImage' \) \
+          find artifacts -type f \( -name '*.zip' -o -name '*.AppImage' -o -name '*.dmg' \) \
             | sort > release_files.txt
           echo "--- Release files ---"
           cat release_files.txt
@@ -226,11 +255,13 @@ jobs:
             ### Platforms
             | OS | Arch | Archive |
             |---|---|---|
-            | macOS | ARM64 (Apple Silicon) | `Aether-macos-arm64.zip` |
-            | macOS | x86_64 (Intel) | `Aether-macos-x86_64.zip` |
+            | macOS | ARM64 (Apple Silicon) | `Aether-macos-arm64.dmg` / `.zip` |
+            | macOS | x86_64 (Intel) | `Aether-macos-x86_64.dmg` / `.zip` |
             | Linux | x86_64 | `Aether-linux-x86_64.AppImage` |
             | Linux | aarch64 | `Aether-linux-aarch64.AppImage` |
             | Windows | x86_64 | `Aether-windows-x86_64.zip` |
+
+            Open the `.dmg`, then drag **Aether.app** into **Applications**.
 
             > **Note:** The macOS bundle is ad-hoc signed, not notarised —
             > right-click → Open on first launch. Linux needs a
@@ -240,5 +271,6 @@ jobs:
           files: |
             artifacts/**/*.zip
             artifacts/**/*.AppImage
+            artifacts/**/*.dmg
           draft: false
           prerelease: false
