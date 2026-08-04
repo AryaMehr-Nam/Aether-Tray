@@ -18,13 +18,7 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-x86_64)        ASSET="aether-macos-x86_64.tar.gz" ;;
   Darwin-arm64)         ASSET="aether-macos-arm64.tar.gz" ;;
   # Git Bash reports MINGW64_NT-*, MSYS reports MSYS_NT-*, Cygwin CYGWIN_NT-*.
-  MINGW*|MSYS*|CYGWIN*)
-    case "$(uname -m)" in
-      x86_64)  ASSET="aether-windows-x86_64.zip" ;;
-      aarch64|ARM64) ASSET="aether-windows-aarch64.zip" ;;
-      *) echo "Unsupported Windows arch: $(uname -m)" >&2; exit 1 ;;
-    esac
-    ;;
+  MINGW*|MSYS*|CYGWIN*) ASSET="aether-windows-x86_64.zip" ;;
   *) echo "Unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 

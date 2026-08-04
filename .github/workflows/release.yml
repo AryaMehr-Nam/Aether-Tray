@@ -41,11 +41,7 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             aether_asset: aether-windows-x86_64.zip
-          - name: windows-aarch64
-            os: windows-latest
-            target: aarch64-pc-windows-msvc
-            aether_asset: aether-windows-aarch64.zip
-            cross: true
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,9 +64,11 @@ jobs:
         if: runner.os == 'Linux' && matrix.cross
         run: |
           sudo dpkg --add-architecture arm64
-          # The GitHub Actions Ubuntu image mirrors are limited; add the
-          # ports mirror which carries the arm64 variants.
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list
+          # Only tag the official Ubuntu repo files with [arch=amd64],
+          # not third-party list files like microsoft-prod.list.
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            [ -f "$f" ] && sudo sed -i 's/^deb /deb [arch=amd64] /' "$f"
+          done
           echo \
             "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" \
             | sudo tee /etc/apt/sources.list.d/arm64-ports.list
@@ -85,10 +83,7 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
-      # ── Windows cross-deps ─────────────────────────────────────────────
-      - name: Install Windows ARM64 toolchain (cross)
-        if: runner.os == 'Windows' && matrix.cross
-        run: rustup target add aarch64-pc-windows-msvc
+
 
       # ── Fetch the Aether core ──────────────────────────────────────────
       # AETHER_ASSET pins the core to the *target* arch, not the runner's.
@@ -136,9 +131,6 @@ jobs:
           TARGET: aarch64-unknown-linux-gnu
           APPIMAGE_ARCH: aarch64
         run: |
-          # appimagetool needs to be the arch-native one; the x86_64
-          # version in the repo can still produce ARM AppImages when
-          # pointed at the right AppDir — the format is arch-agnostic.
           sudo apt-get install -y libfuse2
           curl -fsSL -o /usr/local/bin/appimagetool \
             https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
@@ -222,16 +214,12 @@ jobs:
             | Linux | x86_64 | `Aether-linux-x86_64.AppImage` |
             | Linux | aarch64 | `Aether-linux-aarch64.AppImage` |
             | Windows | x86_64 | `Aether-windows-x86_64.zip` |
-            | Windows | aarch64 | `Aether-windows-aarch64.zip` |
 
             > **Note:** The macOS bundle is ad-hoc signed, not notarised —
             > right-click → Open on first launch. Linux needs a
             > StatusNotifierItem host (GNOME requires an AppIndicator
             > extension); the AppImage falls back to `--no-tray` when none
             > is found.
-            >
-            > Windows ARM64 builds are cross-compiled and may require
-            > additional ARM64 runtime libraries on older Windows versions.
           files: |
             artifacts/**/*.zip
             artifacts/**/*.AppImage
