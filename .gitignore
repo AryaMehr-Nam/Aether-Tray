@@ -5,3 +5,4 @@
 *.zip
 SHA256SUMS.txt
 .DS_Store
+/dist

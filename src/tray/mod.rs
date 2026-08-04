@@ -89,10 +89,29 @@ pub fn run() -> Result<()> {
         }
     }
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = build_event_loop()?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// On macOS an app defaults to `NSApplicationActivationPolicyRegular`, which
+/// puts it in the Dock and in Cmd-Tab. This app owns no window, so that would
+/// leave a Dock icon that does nothing and cannot be closed — `Accessory` is
+/// the policy for a tray-only agent. The `.app` bundle sets `LSUIElement` for
+/// the same reason; this covers running the bare binary.
+fn build_event_loop() -> Result<EventLoop<()>> {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        Ok(EventLoop::builder()
+            .with_activation_policy(ActivationPolicy::Accessory)
+            .build()?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(EventLoop::new()?)
+    }
 }
 
 struct TrayApp {

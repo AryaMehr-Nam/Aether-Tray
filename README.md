@@ -95,6 +95,29 @@ Protocol/Scan-mode loop), re-seeing a header **clears** the answered flag, a bar
 header as the partial buffer must **not** be answered, and "connected" means the
 SOCKS5 port accepts a TCP connect rather than any log text.
 
+Two directories that look interchangeable are not. The core's working directory
+is shared with the windowed app so the provisioned WARP identity persists;
+our own state (the pid file) lives in a separate directory, because orphan
+reaping must never read a pid belonging to another process.
+
+## Packaging
+
+```
+./packaging/macos-app.sh            # dist/Aether.app
+./packaging/linux-appimage.sh       # dist/Aether-<version>-x86_64.AppImage
+pwsh -File packaging/windows-zip.ps1  # dist/Aether-<version>-x86_64-windows.zip
+```
+
+Each script bundles the fetched core next to the executable, where the binary
+looks first. CI (`.github/workflows/ci.yml`) runs fmt, clippy and the tests
+across macOS arm64/x86_64, Linux x86_64 and Windows x86_64; tagging `v*` runs
+`release.yml`, which packages all four and opens a draft release.
+
+The macOS bundle sets `LSUIElement` and the binary requests
+`NSApplicationActivationPolicyAccessory`, so there is no Dock icon or Cmd-Tab
+entry either way. Bundles are **ad-hoc signed only** — a real release needs a
+Developer ID and notarisation, so on first launch users must right-click → Open.
+
 ## Licence
 
 AGPL-3.0-or-later, inherited from Aether-GUI. See [LICENSE](LICENSE).
