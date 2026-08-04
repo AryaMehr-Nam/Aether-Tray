@@ -65,15 +65,20 @@ jobs:
         run: |
           sudo dpkg --add-architecture arm64
 
-          # Restrict ALL existing sources to amd64 only.
-          # Handle DEB822 format (.sources files used on Ubuntu 24.04+).
+          # Disable ALL third-party sources and restrict to amd64.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          sudo rm -f /etc/apt/sources.list.d/arm64-ports.list
+
+          # Replace DEB822 format (.sources) with amd64-only entries.
           for f in /etc/apt/sources.list.d/*.sources; do
             [ -f "$f" ] && sudo sed -i 's/^Architectures:.*/Architectures: amd64/' "$f"
           done
-          # Handle traditional one-line format (.list files).
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+          # Replace traditional format (.list) with amd64-only.
+          for f in /etc/apt/sources.list.d/*.list; do
             [ -f "$f" ] && sudo sed -i 's/^deb /deb [arch=amd64] /' "$f"
           done
+          # Handle /etc/apt/sources.list if it exists.
+          [ -f /etc/apt/sources.list ] && sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
 
           # Add arm64 packages from ports.ubuntu.com.
           # security.ubuntu.com does NOT serve arm64; only ports.ubuntu.com does.
