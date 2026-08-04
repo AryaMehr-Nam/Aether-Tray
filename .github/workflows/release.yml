@@ -59,19 +59,30 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
       # Cross-compiling for aarch64 on an x86_64 runner needs the ARM
-      # versions of GTK and the appindicator library.
+      # versions of GTK, the appindicator library, and libxdo.
       - name: Install Linux tray dependencies (cross aarch64)
         if: runner.os == 'Linux' && matrix.cross
         run: |
           sudo dpkg --add-architecture arm64
-          # Only tag the official Ubuntu repo files with [arch=amd64],
-          # not third-party list files like microsoft-prod.list.
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+
+          # Restrict ALL existing sources to amd64 only.
+          # Handle DEB822 format (.sources files used on Ubuntu 24.04+).
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] && sudo sed -i 's/^Architectures:.*/Architectures: amd64/' "$f"
+          done
+          # Handle traditional one-line format (.list files).
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
             [ -f "$f" ] && sudo sed -i 's/^deb /deb [arch=amd64] /' "$f"
           done
-          echo \
-            "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" \
-            | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+
+          # Add arm64 packages from ports.ubuntu.com.
+          # security.ubuntu.com does NOT serve arm64; only ports.ubuntu.com does.
+          UBUNTU_CODENAME=$(lsb_release -cs)
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $UBUNTU_CODENAME-backports main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev:arm64 \
