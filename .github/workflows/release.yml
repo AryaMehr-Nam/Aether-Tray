@@ -47,7 +47,10 @@ jobs:
           - name: linux-aarch64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            aether_asset: aether-linux-aarch64.tar.gz
+            # The core release names the glibc ARM64 asset "arm64" (only the
+            # musl variant is called "aarch64"), so this must NOT be
+            # aether-linux-aarch64.tar.gz — that URL 404s.
+            aether_asset: aether-linux-arm64.tar.gz
             cross: true
           - name: windows-x86_64
             os: windows-latest
