@@ -26,6 +26,7 @@ use crate::core::profile::ZeroTrustAuth;
 use crate::core::{Command, ConnectionState, LogEvent, StatusEvent, Supervisor};
 use crate::dialog;
 use crate::notify;
+use icons::Appearance;
 use menu::MenuAction;
 
 /// Emitted by the PTY reader when Cloudflare Access wants a one-time code.
@@ -60,6 +61,9 @@ pub fn run() -> Result<()> {
             .and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok()),
         code_prompt_open: false,
         interrupt: Arc::new(AtomicBool::new(false)),
+        // Corrected from the real system theme as soon as the loop starts;
+        // dark is the safer guess for a menu bar if that is unavailable.
+        appearance: Appearance::Dark,
         config,
     };
 
@@ -127,13 +131,17 @@ struct TrayApp {
     /// Set from the Ctrl-C handler; polled by the event loop because a signal
     /// handler must not touch the supervisor or the tray directly.
     interrupt: Arc<AtomicBool>,
+    /// Menu-bar appearance the icon was last painted for. The icon is not a
+    /// template image (it carries a coloured status dot), so nothing repaints
+    /// it automatically when the user switches between light and dark.
+    appearance: Appearance,
 }
 
 impl TrayApp {
     fn build_tray(&self) -> Result<TrayIcon> {
         let menu = menu::build(&self.state, &self.config)?;
         let tray = TrayIconBuilder::new()
-            .with_icon(icons::for_state(&self.state))
+            .with_icon(icons::for_state(&self.state, self.appearance))
             .with_tooltip(format!("Aether — {}", self.state.label()))
             .with_menu(Box::new(menu))
             .build()?;
@@ -151,7 +159,7 @@ impl TrayApp {
     fn apply_state(&mut self, new_state: ConnectionState) {
         let previous = std::mem::replace(&mut self.state, new_state);
         if let Some(tray) = &self.tray {
-            let _ = tray.set_icon(Some(icons::for_state(&self.state)));
+            let _ = tray.set_icon(Some(icons::for_state(&self.state, self.appearance)));
             let _ = tray.set_tooltip(Some(format!("Aether — {}", self.state.label())));
         }
         self.rebuild_menu();
@@ -407,9 +415,33 @@ impl TrayApp {
         self.rebuild_menu();
     }
 
+    /// Repaints the icon when the user switches between light and dark.
+    ///
+    /// A macOS template image would track the menu bar for free, but this
+    /// icon carries a coloured status dot and template images are rendered
+    /// from alpha alone — the dot would lose its colour. The cost of keeping
+    /// the colour is doing this flip by hand.
+    fn sync_appearance(&mut self, event_loop: &ActiveEventLoop) {
+        let current = match event_loop.system_theme() {
+            Some(winit::window::Theme::Light) => Appearance::Light,
+            Some(winit::window::Theme::Dark) => Appearance::Dark,
+            // No reported theme (common on Linux): keep whatever we have
+            // rather than flapping between the two.
+            None => return,
+        };
+        if current == self.appearance {
+            return;
+        }
+        self.appearance = current;
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_icon(Some(icons::for_state(&self.state, self.appearance)));
+        }
+    }
+
     /// One iteration of periodic work: drain the supervisor, service menu
     /// clicks, honour an interrupt, then arm the next wakeup.
     fn pump(&mut self, event_loop: &ActiveEventLoop) {
+        self.sync_appearance(event_loop);
         self.drain_channels();
 
         // muda delivers menu clicks on its own channel, not through winit.
