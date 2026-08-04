@@ -2,6 +2,7 @@
 //! machine. Ported from the windowed app's `aether/mod.rs`, with Tauri's
 //! `AppHandle`/`emit` replaced by plain channels.
 
+pub mod geo;
 pub mod orphan;
 pub mod profile;
 pub mod prompts;
@@ -10,7 +11,7 @@ pub mod status;
 
 use crate::config::Config;
 use anyhow::{Result, anyhow};
-use log::error;
+use log::{error, info, warn};
 use profile::ConnectionProfile;
 use pty::PtySession;
 use std::path::PathBuf;
@@ -114,6 +115,14 @@ struct Inner {
     /// proven-working connection earns a full retry budget for whatever
     /// drops it next), and on a user-requested disconnect.
     retry_count: u32,
+    /// Last resolved tunnel exit info (IP/location/ISP), refreshed on every
+    /// new Connected state. `None` until a lookup succeeds — the supervisor
+    /// records no error state for a failed lookup, the UI just omits it.
+    geo: Option<geo::GeoInfo>,
+    /// Whether the current tunnel's lookup has finished (success or failure).
+    /// Lets the UI tell "resolving…" from "unavailable" instead of showing
+    /// the former forever after a failure.
+    geo_lookup_done: bool,
 }
 
 #[derive(Clone)]
@@ -163,6 +172,8 @@ impl Supervisor {
                 state: ConnectionState::Idle,
                 user_requested_stop: false,
                 retry_count: 0,
+                geo: None,
+                geo_lookup_done: false,
             })),
             status_tx,
             log_tx,
@@ -184,6 +195,59 @@ impl Supervisor {
 
     pub fn state(&self) -> ConnectionState {
         self.inner.lock().unwrap().state.clone()
+    }
+
+    /// The current tunnel's lookup outcome. Polled by the UI (tray and
+    /// headless) and read by the IPC status handler.
+    pub fn geo_state(&self) -> geo::GeoState {
+        let inner = self.inner.lock().unwrap();
+        geo::GeoState {
+            info: inner.geo.clone(),
+            done: inner.geo_lookup_done,
+        }
+    }
+
+    /// Records a lookup result only while it still describes the current
+    /// tunnel. The lookup runs on a detached thread; by the time it lands
+    /// the user may have disconnected (stale geo must not resurface) or a
+    /// retry may have connected again (an old thread's *failure* must not
+    /// wipe the new tunnel's fresh result). Keying on `connected_at_ms` —
+    /// unique per Connected state — makes both cases a no-op.
+    fn set_geo_if_current(&self, connected_at_ms: u64, geo: Option<geo::GeoInfo>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let ConnectionState::Connected {
+            connected_at_ms: current,
+            ..
+        } = &inner.state
+            && *current == connected_at_ms
+        {
+            inner.geo = geo;
+            inner.geo_lookup_done = true;
+        }
+    }
+
+    /// Re-runs the connection-info lookup for the live connection, e.g. from
+    /// the tray's "Refresh connection info" item after a failure. No-op
+    /// unless currently Connected.
+    pub fn refresh_geo(&self) {
+        let (socks, connected_at_ms) = {
+            let mut inner = self.inner.lock().unwrap();
+            let ConnectionState::Connected {
+                socks_addr,
+                connected_at_ms,
+            } = &inner.state
+            else {
+                return;
+            };
+            // Copy out before mutating: `socks_addr` borrows `inner.state`.
+            let socks = status::parse_bind_address(socks_addr);
+            let connected_at_ms = *connected_at_ms;
+            // Back to "resolving…" until the fresh result lands.
+            inner.geo = None;
+            inner.geo_lookup_done = false;
+            (socks, connected_at_ms)
+        };
+        self.start_geo_lookup(socks, connected_at_ms);
     }
 
     /// Drains commands until `Shutdown`. Each command returns promptly —
@@ -263,6 +327,9 @@ impl Supervisor {
             inner.state = ConnectionState::Launching;
             // A fresh user-initiated connect always gets a full retry budget.
             inner.retry_count = 0;
+            // Any previous exit info is stale for the new tunnel.
+            inner.geo = None;
+            inner.geo_lookup_done = false;
         }
         let _ = self
             .status_tx
@@ -348,9 +415,10 @@ impl Supervisor {
             }
 
             if status::port_is_live(&socks) {
+                let connected_at_ms = now_millis();
                 let new_state = ConnectionState::Connected {
                     socks_addr: profile.bind_address.clone(),
-                    connected_at_ms: now_millis(),
+                    connected_at_ms,
                 };
                 inner.state = new_state.clone();
                 // Proven working — a future drop earns a fresh full retry
@@ -361,6 +429,7 @@ impl Supervisor {
                 // Only persisted as "last successful" once actually proven to
                 // work, never on a mere attempt.
                 self.persist_successful_profile(&profile);
+                self.start_geo_lookup(socks, connected_at_ms);
                 self.monitor_connected(profile);
                 return;
             }
@@ -378,6 +447,38 @@ impl Supervisor {
                 );
                 return;
             }
+        }
+    }
+
+    /// Fires off the connection-info lookup (through the tunnel, see
+    /// geo.rs) on a detached thread. The result lands in `Inner.geo`; the
+    /// request has its own timeouts, so a dead endpoint can never stall the
+    /// supervisor. Gated by the user setting, read fresh from disk so a
+    /// privacy-minded toggle-off stops future lookups immediately.
+    fn start_geo_lookup(&self, socks: std::net::SocketAddr, connected_at_ms: u64) {
+        let enabled = crate::config::Config::load()
+            .map(|c| c.settings.show_connection_info)
+            .unwrap_or(true);
+        if !enabled {
+            return;
+        }
+        let this = self.clone();
+        if std::thread::Builder::new()
+            .name("geo-lookup".into())
+            .spawn(move || match geo::lookup(&socks) {
+                Ok(info) => {
+                    info!("connection info: {}", info.summary());
+                    this.set_geo_if_current(connected_at_ms, Some(info));
+                }
+                Err(e) => {
+                    // The connection is fine; only the metadata lookup failed.
+                    warn!("connection-info lookup failed: {e}");
+                    this.set_geo_if_current(connected_at_ms, None);
+                }
+            })
+            .is_err()
+        {
+            warn!("could not spawn connection-info lookup");
         }
     }
 
@@ -423,6 +524,9 @@ impl Supervisor {
             }
             inner.session = None;
             inner.retry_count += 1;
+            // The tunnel is gone; so is its exit info.
+            inner.geo = None;
+            inner.geo_lookup_done = false;
             inner.retry_count
         };
         orphan::clear_pid(&self.state_dir);
@@ -481,6 +585,12 @@ impl Supervisor {
             self.set_state(ConnectionState::Idle);
             return Ok(());
         }
+
+        // A disconnect ends the tunnel, so its exit info goes with it.
+        let mut inner = self.inner.lock().unwrap();
+        inner.geo = None;
+        inner.geo_lookup_done = false;
+        drop(inner);
 
         self.set_state(ConnectionState::Disconnecting);
 
@@ -542,6 +652,8 @@ impl Supervisor {
         }
         inner.session = None;
         inner.state = ConnectionState::Idle;
+        inner.geo = None;
+        inner.geo_lookup_done = false;
         drop(inner);
         orphan::clear_pid(&self.state_dir);
     }

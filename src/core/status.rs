@@ -12,7 +12,8 @@ pub fn parse_bind_address(addr: &str) -> SocketAddr {
 }
 
 /// When Aether listens on 0.0.0.0, we probe 127.0.0.1 instead.
-fn probe_addr(listen: &SocketAddr) -> SocketAddr {
+/// `pub(crate)`: the geo lookup must reach the same address.
+pub(crate) fn probe_addr(listen: &SocketAddr) -> SocketAddr {
     if listen.ip().is_unspecified() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port())
     } else {

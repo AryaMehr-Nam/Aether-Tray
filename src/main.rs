@@ -10,6 +10,7 @@ mod tray;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::core::ConnectionState;
 use ipc::{Overrides, Request, Response};
 
 #[derive(Parser)]
@@ -104,17 +105,27 @@ fn simple(request: Request) -> Result<()> {
 }
 
 fn status(json: bool) -> Result<()> {
-    let state = match ipc::client::send(&Request::Status)? {
-        Some(Response::Status { state }) => Some(state),
+    let (state, geo) = match ipc::client::send(&Request::Status)? {
+        Some(Response::Status { state, geo }) => (Some(state), geo),
         Some(other) => return report(other),
-        None => None,
+        None => (None, None),
     };
 
     if json {
         // A machine-readable "not running" beats a non-zero exit with no
         // parseable body when --json was explicitly requested.
         let value = match &state {
-            Some(state) => serde_json::to_value(state)?,
+            Some(state) => {
+                let mut value = serde_json::to_value(state)?;
+                // Geo only ever describes a live tunnel; never report it for
+                // a disconnected (possibly raced) state.
+                if matches!(state, ConnectionState::Connected { .. })
+                    && let Some(geo) = &geo
+                {
+                    value["geo"] = serde_json::to_value(geo)?;
+                }
+                value
+            }
             None => serde_json::json!({ "state": "not_running" }),
         };
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -122,7 +133,16 @@ fn status(json: bool) -> Result<()> {
     }
 
     match state {
-        Some(state) => println!("{}", state.label()),
+        Some(state) => {
+            println!("{}", state.label());
+            // The geo summary only describes a live tunnel, so it is never
+            // printed for a stale or idle state.
+            if matches!(state, ConnectionState::Connected { .. })
+                && let Some(geo) = &geo
+            {
+                println!("{}", geo.summary());
+            }
+        }
         None => {
             println!("Not running");
             std::process::exit(1);
@@ -134,7 +154,7 @@ fn status(json: bool) -> Result<()> {
 fn report(response: Response) -> Result<()> {
     match response {
         Response::Ok { message } => println!("{message}"),
-        Response::Status { state } => println!("{}", state.label()),
+        Response::Status { state, .. } => println!("{}", state.label()),
         Response::Error { message } => {
             eprintln!("Error: {message}");
             std::process::exit(1);

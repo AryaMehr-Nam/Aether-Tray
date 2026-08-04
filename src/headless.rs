@@ -49,6 +49,8 @@ pub fn run(overrides: Option<Overrides>) -> Result<()> {
         .send(Command::connect(config.profile.clone()))?;
 
     let stdin_is_tty = std::io::stdin().is_terminal();
+    // Geo resolves asynchronously after Connected; print it once per tunnel.
+    let mut geo_printed = false;
     loop {
         // Logs and status arrive on separate channels; poll both rather than
         // blocking on either, so neither can starve the other.
@@ -69,10 +71,18 @@ pub fn run(overrides: Option<Overrides>) -> Result<()> {
 
         while let Ok(StatusEvent::StateChange(state)) = handles.status.try_recv() {
             eprintln!("[state] {}", state.label());
-            if matches!(state, ConnectionState::Error { .. }) {
-                // Retries are exhausted by the time Error is reached.
-                return Err(anyhow!("{}", state.label()));
+            match state {
+                ConnectionState::Connected { .. } => geo_printed = false,
+                ConnectionState::Error { .. } => {
+                    // Retries are exhausted by the time Error is reached.
+                    return Err(anyhow!("{}", state.label()));
+                }
+                _ => {}
             }
+        }
+        if !geo_printed && let Some(info) = handles.supervisor.geo_state().info {
+            println!("[connection] {}", info.summary());
+            geo_printed = true;
         }
     }
 }

@@ -18,6 +18,37 @@ elevation anywhere.
 curl --socks5 127.0.0.1:1819 https://cloudflare.com/cdn-cgi/trace
 ```
 
+## Connection info
+
+Once connected, the tray resolves what the tunnel actually looks like from the
+outside by asking [`ifconfig.co`](https://ifconfig.co) *through* the SOCKS5
+proxy (`socks5h://`, so DNS stays inside the tunnel too): exit IP, city/region/
+country, and ISP/ASN. The result appears in the tray menu (IP, Location, ISP,
+plus a live uptime), can be copied with "Copy IP address", and is included in
+`aether-tray status --json` as a `geo` object:
+
+```json
+{
+  "state": "connected",
+  "socks_addr": "127.0.0.1:1819",
+  "connected_at_ms": 1723000000000,
+  "geo": {
+    "ip": "104.28.246.164",
+    "country": "Iran",
+    "city": "Tehran",
+    "asn": "AS13335",
+    "asn_org": "CLOUDFLARENET"
+  }
+}
+```
+
+The lookup is fire-and-forget: a failure never disturbs the connection — the
+menu shows "IP: unavailable" rather than "resolving…", and "Refresh connection
+info" re-runs the lookup without reconnecting. Because it is an extra request
+to a third party, it is a setting — uncheck "Connection info" in the tray menu
+(or set `show_connection_info = false` in `config.toml`) to stop the lookup
+entirely.
+
 ## Getting the core binary
 
 The `aether` core is a separate executable, not vendored here:
@@ -72,6 +103,10 @@ The profile is persisted only on reaching `Connected`, never on a mere attempt,
 so a bad guess cannot poison future one-click connects. All four Cloudflare
 Access credentials are scrubbed before writing — they stay in process memory for
 the session and are asked for again next launch.
+
+App-level settings live in `config.toml` too: `notifications`,
+`launch_at_login`, `connect_on_launch`, `show_connection_info` (see
+[Connection info](#connection-info)) and the optional `core_path`.
 
 On first run, settings are migrated from the Tauri stores of the windowed
 Aether-GUI app (`com.cluvexstudio.aethergui`). The originals are left untouched,

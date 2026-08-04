@@ -10,6 +10,7 @@ pub mod menu;
 
 use anyhow::Result;
 use log::{error, warn};
+use muda::MenuItem;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
 use crate::config::Config;
+use crate::core::geo::GeoState;
 use crate::core::profile::ZeroTrustAuth;
 use crate::core::{Command, ConnectionState, LogEvent, StatusEvent, Supervisor};
 use crate::dialog;
@@ -61,6 +63,9 @@ pub fn run() -> Result<()> {
             .and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok()),
         code_prompt_open: false,
         interrupt: Arc::new(AtomicBool::new(false)),
+        geo_state: GeoState::default(),
+        uptime_item: None,
+        menu_tick: Instant::now(),
         // Corrected from the real system theme as soon as the loop starts;
         // dark is the safer guess for a menu bar if that is unavailable.
         appearance: Appearance::Dark,
@@ -131,6 +136,15 @@ struct TrayApp {
     /// Set from the Ctrl-C handler; polled by the event loop because a signal
     /// handler must not touch the supervisor or the tray directly.
     interrupt: Arc<AtomicBool>,
+    /// Last seen tunnel-exit lookup outcome, mirrored from the supervisor so
+    /// the menu only rebuilds when the value actually changes.
+    geo_state: GeoState,
+    /// The uptime item from the current menu, updated in place once a second
+    /// so the label ticks without rebuilding (a rebuild dismisses an open
+    /// native menu).
+    uptime_item: Option<MenuItem>,
+    /// Last time the uptime label was updated.
+    menu_tick: Instant,
     /// Menu-bar appearance the icon was last painted for. The icon is not a
     /// template image (it carries a coloured status dot), so nothing repaints
     /// it automatically when the user switches between light and dark.
@@ -138,8 +152,10 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn build_tray(&self) -> Result<TrayIcon> {
-        let menu = menu::build(&self.state, &self.config)?;
+    fn build_tray(&mut self) -> Result<TrayIcon> {
+        let built = menu::build(&self.state, &self.config, &self.geo_state)?;
+        self.uptime_item = built.uptime_item;
+        let menu = built.menu;
         let tray = TrayIconBuilder::new()
             .with_icon(icons::for_state(&self.state, self.appearance))
             .with_tooltip(format!("Aether — {}", self.state.label()))
@@ -148,16 +164,24 @@ impl TrayApp {
         Ok(tray)
     }
 
-    fn rebuild_menu(&self) {
+    fn rebuild_menu(&mut self) {
         let Some(tray) = &self.tray else { return };
-        match menu::build(&self.state, &self.config) {
-            Ok(m) => tray.set_menu(Some(Box::new(m))),
+        match menu::build(&self.state, &self.config, &self.geo_state) {
+            Ok(built) => {
+                self.uptime_item = built.uptime_item;
+                tray.set_menu(Some(Box::new(built.menu)));
+            }
             Err(e) => error!("could not rebuild menu: {e}"),
         }
     }
 
     fn apply_state(&mut self, new_state: ConnectionState) {
         let previous = std::mem::replace(&mut self.state, new_state);
+        // A fresh tunnel means the previous exit info is stale; the menu
+        // shows "IP: resolving…" until the new lookup lands (or fails).
+        if matches!(self.state, ConnectionState::Connected { .. }) {
+            self.geo_state = GeoState::default();
+        }
         if let Some(tray) = &self.tray {
             let _ = tray.set_icon(Some(icons::for_state(&self.state, self.appearance)));
             let _ = tray.set_tooltip(Some(format!("Aether — {}", self.state.label())));
@@ -249,6 +273,12 @@ impl TrayApp {
 
     fn handle(&mut self, action: MenuAction, event_loop: &ActiveEventLoop) {
         match action {
+            MenuAction::CopyIp => {
+                if let Some(info) = &self.geo_state.info {
+                    self.copy_text(&info.ip);
+                }
+            }
+            MenuAction::RefreshConnectionInfo => self.supervisor.refresh_geo(),
             MenuAction::Toggle => match self.state {
                 ConnectionState::Idle | ConnectionState::Error { .. } => {
                     let _ = self
@@ -297,6 +327,15 @@ impl TrayApp {
             MenuAction::ToggleNotifications => {
                 self.config.settings.notifications = !self.config.settings.notifications;
                 self.save_config();
+            }
+            MenuAction::ToggleConnectionInfo => {
+                self.config.settings.show_connection_info =
+                    !self.config.settings.show_connection_info;
+                self.save_config();
+                // Drop the cached copy either way so the next tick's poll
+                // rebuilds with the new setting — hiding the section when
+                // toggled off, or re-pulling the supervisor when toggled on.
+                self.geo_state = GeoState::default();
             }
             MenuAction::ToggleConnectOnLaunch => {
                 self.config.settings.connect_on_launch = !self.config.settings.connect_on_launch;
@@ -444,6 +483,27 @@ impl TrayApp {
         self.sync_appearance(event_loop);
         self.drain_channels();
 
+        // The geo lookup lands on its own thread with no channel; poll for
+        // it here and rebuild only when the value changes.
+        let fresh_geo = self.supervisor.geo_state();
+        if fresh_geo != self.geo_state {
+            self.geo_state = fresh_geo;
+            self.rebuild_menu();
+        }
+        // While connected, tick the uptime label in place — `set_text` never
+        // rebuilds the native menu, so an open menu is not dismissed (a full
+        // rebuild on a timer is exactly what caused the menu to close).
+        if let ConnectionState::Connected {
+            connected_at_ms, ..
+        } = &self.state
+            && self.menu_tick.elapsed() >= Duration::from_secs(1)
+        {
+            self.menu_tick = Instant::now();
+            if let Some(item) = &self.uptime_item {
+                item.set_text(menu::uptime_label(*connected_at_ms));
+            }
+        }
+
         // muda delivers menu clicks on its own channel, not through winit.
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             if let Some(action) = menu::action_for(&event.id) {
@@ -467,7 +527,11 @@ impl TrayApp {
 
     fn copy_proxy_address(&self) {
         let addr = self.config.profile.bind_address.clone();
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(addr)) {
+        self.copy_text(&addr);
+    }
+
+    fn copy_text(&self, text: &str) {
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
             Ok(()) => {}
             Err(e) => warn!("clipboard unavailable: {e}"),
         }

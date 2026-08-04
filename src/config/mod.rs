@@ -36,6 +36,12 @@ pub struct Settings {
     pub launch_at_login: bool,
     #[serde(default)]
     pub connect_on_launch: bool,
+    /// Resolve and display the tunnel's exit IP/location/ISP (a request to
+    /// ifconfig.co *through* the tunnel). Off by... on by default, but the
+    /// menu checkbox exists because a third-party lookup may be unwanted on
+    /// some networks.
+    #[serde(default = "default_true")]
+    pub show_connection_info: bool,
     /// Optional explicit path to the core binary — step 2 of the lookup
     /// order (`<exe_dir>/aether` → `core_path` → `$PATH`).
     #[serde(default)]
@@ -52,6 +58,7 @@ impl Default for Settings {
             notifications: true,
             launch_at_login: false,
             connect_on_launch: false,
+            show_connection_info: true,
             core_path: None,
         }
     }

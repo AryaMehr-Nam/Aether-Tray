@@ -6,11 +6,15 @@ use muda::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::config::Config;
 use crate::core::ConnectionState;
+use crate::core::geo::GeoState;
 use crate::core::profile::{
     ConnectionProfile, IpVersion, MasqueNoize, Protocol, ScanMode, WgNoize, ZeroTrustAuth,
 };
 
 pub const ID_TOGGLE: &str = "toggle";
+pub const ID_COPY_IP: &str = "copy_ip";
+pub const ID_REFRESH_CONNECTION_INFO: &str = "refresh_connection_info";
+pub const ID_UPTIME: &str = "uptime";
 pub const ID_COPY_PROXY: &str = "copy_proxy";
 pub const ID_SHOW_LOGS: &str = "show_logs";
 pub const ID_QUIT: &str = "quit";
@@ -25,6 +29,7 @@ pub const ID_ZT_GATEWAY: &str = "toggle.zt_gateway";
 pub const ID_QUICK_RECONNECT: &str = "toggle.quick_reconnect";
 pub const ID_MASQUE_HTTP2: &str = "toggle.masque_http2";
 pub const ID_NOTIFICATIONS: &str = "toggle.notifications";
+pub const ID_CONNECTION_INFO: &str = "toggle.connection_info";
 pub const ID_LAUNCH_AT_LOGIN: &str = "toggle.launch_at_login";
 pub const ID_CONNECT_ON_LAUNCH: &str = "toggle.connect_on_launch";
 pub const ID_OPEN_CONFIG: &str = "open_config";
@@ -41,6 +46,8 @@ pub const PREFIX_ZT_AUTH: &str = "ztauth.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuAction {
     Toggle,
+    CopyIp,
+    RefreshConnectionInfo,
     CopyProxy,
     ShowLogs,
     OpenConfig,
@@ -55,6 +62,7 @@ pub enum MenuAction {
     ToggleMasqueHttp2,
     ToggleZeroTrustGateway,
     ToggleNotifications,
+    ToggleConnectionInfo,
     ToggleLaunchAtLogin,
     ToggleConnectOnLaunch,
     EditBindAddress,
@@ -71,6 +79,8 @@ pub fn action_for(id: &MenuId) -> Option<MenuAction> {
     let raw = id.as_ref();
     let action = match raw {
         ID_TOGGLE => MenuAction::Toggle,
+        ID_COPY_IP => MenuAction::CopyIp,
+        ID_REFRESH_CONNECTION_INFO => MenuAction::RefreshConnectionInfo,
         ID_COPY_PROXY => MenuAction::CopyProxy,
         ID_SHOW_LOGS => MenuAction::ShowLogs,
         ID_OPEN_CONFIG => MenuAction::OpenConfig,
@@ -86,6 +96,7 @@ pub fn action_for(id: &MenuId) -> Option<MenuAction> {
         ID_QUICK_RECONNECT => MenuAction::ToggleQuickReconnect,
         ID_MASQUE_HTTP2 => MenuAction::ToggleMasqueHttp2,
         ID_NOTIFICATIONS => MenuAction::ToggleNotifications,
+        ID_CONNECTION_INFO => MenuAction::ToggleConnectionInfo,
         ID_LAUNCH_AT_LOGIN => MenuAction::ToggleLaunchAtLogin,
         ID_CONNECT_ON_LAUNCH => MenuAction::ToggleConnectOnLaunch,
         other => return action_for_radio(other),
@@ -167,13 +178,45 @@ fn summary(value: &str, empty: &str) -> String {
     }
 }
 
+/// "2h 3m" / "3m 12s" / "12s" — the displayed uptime granularity follows
+/// the magnitude, so a fresh connection doesn't show a static "0s".
+pub fn format_uptime(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// The live uptime label for a connection started at `connected_at_ms`,
+/// recomputed on every call. The tray updates the menu item's text in place
+/// (never rebuilding the menu) so an open menu is not dismissed.
+pub fn uptime_label(connected_at_ms: u64) -> String {
+    let uptime = crate::core::now_millis().saturating_sub(connected_at_ms) / 1000;
+    format!("Uptime: {}", format_uptime(uptime))
+}
+
+/// The result of building the menu: the menu itself plus a handle to the
+/// live uptime item (present only while Connected), which the tray updates
+/// in place via `set_text` rather than rebuilding the whole menu.
+pub struct BuiltMenu {
+    pub menu: Menu,
+    pub uptime_item: Option<MenuItem>,
+}
+
 /// Builds the whole menu for the current state and config.
 ///
-/// Everything below the status line is disabled while the state is not
-/// resting, mirroring the windowed app's locking: the core reads its whole
-/// profile at spawn, so changing a setting mid-connection would silently not
-/// apply.
-pub fn build(state: &ConnectionState, config: &Config) -> muda::Result<Menu> {
+/// `geo` is the supervisor's lookup outcome for the current tunnel; it is
+/// only ever shown while Connected. Everything below the status line is
+/// disabled while the state is not resting, mirroring the windowed app's
+/// locking: the core reads its whole profile at spawn, so changing a setting
+/// mid-connection would silently not apply.
+pub fn build(state: &ConnectionState, config: &Config, geo: &GeoState) -> muda::Result<BuiltMenu> {
     let menu = Menu::new();
     let p = &config.profile;
     let unlocked = state.is_resting();
@@ -189,6 +232,49 @@ pub fn build(state: &ConnectionState, config: &Config) -> muda::Result<Menu> {
         false,
         None,
     ))?;
+
+    let connected = matches!(state, ConnectionState::Connected { .. });
+    let mut uptime_item = None;
+    if connected {
+        // One connection-info submenu: its title is the tunnel's IP and
+        // location ("104.28.214.167 (Tehran, Iran)"), and its only items are
+        // the two actions that ever act on that info. Gated on the setting so
+        // turning "Connection info" off hides what is already cached too;
+        // the lookup's own state titles the submenu "resolving…"/"unavailable"
+        // until it settles.
+        if config.settings.show_connection_info {
+            let title = match &geo.info {
+                Some(info) => match info.location() {
+                    Some(loc) => format!("{} ({loc})", info.ip),
+                    None => info.ip.clone(),
+                },
+                None if geo.done => "IP: unavailable".into(),
+                None => "IP: resolving…".into(),
+            };
+            let connection = Submenu::new(title, true);
+            connection.append(&MenuItem::with_id(
+                ID_COPY_IP,
+                "Copy IP",
+                geo.info.is_some(),
+                None,
+            ))?;
+            connection.append(&MenuItem::with_id(
+                ID_REFRESH_CONNECTION_INFO,
+                "Refresh",
+                true,
+                None,
+            ))?;
+            menu.append(&connection)?;
+        }
+        if let ConnectionState::Connected {
+            connected_at_ms, ..
+        } = state
+        {
+            let uptime = MenuItem::with_id(ID_UPTIME, uptime_label(*connected_at_ms), false, None);
+            menu.append(&uptime)?;
+            uptime_item = Some(uptime);
+        }
+    }
     menu.append(&PredefinedMenuItem::separator())?;
 
     menu.append(&MenuItem::with_id(
@@ -200,7 +286,7 @@ pub fn build(state: &ConnectionState, config: &Config) -> muda::Result<Menu> {
     menu.append(&MenuItem::with_id(
         ID_COPY_PROXY,
         format!("Copy proxy address  ({})", p.bind_address),
-        matches!(state, ConnectionState::Connected { .. }),
+        connected,
         None,
     ))?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -338,6 +424,13 @@ pub fn build(state: &ConnectionState, config: &Config) -> muda::Result<Menu> {
         None,
     ))?;
     menu.append(&CheckMenuItem::with_id(
+        ID_CONNECTION_INFO,
+        "Connection info",
+        true,
+        config.settings.show_connection_info,
+        None,
+    ))?;
+    menu.append(&CheckMenuItem::with_id(
         ID_LAUNCH_AT_LOGIN,
         "Launch at login",
         true,
@@ -362,7 +455,7 @@ pub fn build(state: &ConnectionState, config: &Config) -> muda::Result<Menu> {
     ))?;
     menu.append(&MenuItem::with_id(ID_QUIT, "Quit", true, None))?;
 
-    Ok(menu)
+    Ok(BuiltMenu { menu, uptime_item })
 }
 
 fn zero_trust_submenu(
@@ -528,5 +621,26 @@ mod tests {
     fn summary_falls_back_for_blank_values() {
         assert_eq!(summary("   ", "(none)"), "(none)");
         assert_eq!(summary(" 1.1.1.1 ", "(none)"), "1.1.1.1");
+    }
+
+    #[test]
+    fn uptime_formatting_follows_magnitude() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(12), "12s");
+        assert_eq!(format_uptime(192), "3m 12s");
+        assert_eq!(format_uptime(7380), "2h 3m");
+    }
+
+    #[test]
+    fn copy_ip_maps_to_its_action() {
+        assert_eq!(action_for(&id(ID_COPY_IP)), Some(MenuAction::CopyIp));
+        assert_eq!(
+            action_for(&id(ID_REFRESH_CONNECTION_INFO)),
+            Some(MenuAction::RefreshConnectionInfo)
+        );
+        assert_eq!(
+            action_for(&id(ID_CONNECTION_INFO)),
+            Some(MenuAction::ToggleConnectionInfo)
+        );
     }
 }

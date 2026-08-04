@@ -66,12 +66,27 @@ impl Overrides {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Note: deliberately not `Eq` — `geo` carries floating-point coordinates,
+// and equality for tests only needs `PartialEq`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum Response {
-    Ok { message: String },
-    Error { message: String },
-    Status { state: crate::core::ConnectionState },
+    Ok {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    Status {
+        state: crate::core::ConnectionState,
+        /// Tunnel exit info, present only while Connected (and only when the
+        /// lookup succeeded). Boxed for the same reason `Command::Connect`
+        /// boxes its profile: the info struct is far larger than the other
+        /// variants' payloads. `serde(default)` keeps the wire format
+        /// readable by older clients that predate the field.
+        #[serde(default)]
+        geo: Option<Box<crate::core::geo::GeoInfo>>,
+    },
 }
 
 #[cfg(test)]
@@ -110,6 +125,10 @@ mod tests {
                 socks_addr: "127.0.0.1:1819".into(),
                 connected_at_ms: 12,
             },
+            geo: Some(Box::new(crate::core::geo::GeoInfo {
+                ip: "104.28.246.164".into(),
+                ..Default::default()
+            })),
         };
         let encoded = serde_json::to_string(&response).unwrap();
         assert!(!encoded.contains('\n'));

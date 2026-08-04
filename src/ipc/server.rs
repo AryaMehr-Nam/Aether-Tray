@@ -94,6 +94,7 @@ fn dispatch(request: Request, supervisor: &Supervisor, commands: &Sender<Command
     match request {
         Request::Status => Response::Status {
             state: supervisor.state(),
+            geo: supervisor.geo_state().info.map(Box::new),
         },
         Request::Disconnect => match commands.send(Command::Disconnect) {
             Ok(()) => Response::Ok {
