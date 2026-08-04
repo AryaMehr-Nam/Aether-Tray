@@ -131,9 +131,21 @@ jobs:
             libxdo-dev:arm64 \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu
-          # Tell Cargo which linker to use for the cross target.
+          # Tell Cargo which linker to use for the cross target, and set the
+          # pkg-config env vars that glib-sys/gtk-sys need to find the arm64
+          # .pc files. Cargo's [env] table applies them to every build script,
+          # so the Build step itself needs no extra env. Without ALLOW_CROSS
+          # + the arm64 LIBDIR, pkg-config refuses: "has not been configured
+          # to support cross-compilation".
           mkdir -p ~/.cargo
-          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+          echo '' >> ~/.cargo/config.toml
+          echo '[env]' >> ~/.cargo/config.toml
+          echo 'PKG_CONFIG_ALLOW_CROSS = "1"' >> ~/.cargo/config.toml
+          echo 'PKG_CONFIG_LIBDIR = "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"' >> ~/.cargo/config.toml
+          echo 'PKG_CONFIG_SYSROOT_DIR = "/"' >> ~/.cargo/config.toml
+          echo 'CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
       # ── Fetch the Aether core ──────────────────────────────────────────
       # AETHER_ASSET pins the core to the *target* arch, not the runner's.
@@ -245,32 +257,29 @@ jobs:
           echo "--- Release files ---"
           cat release_files.txt
 
+      # The release body comes from CHANGELOG.md: the entry whose header is
+      # "## [<tag>]" (headers use the tag format, so the match is exact).
+      # Falls back to a placeholder if the entry is missing, so a forgotten
+      # changelog update can't fail the release — it just ships a shorter body.
+      - name: Extract changelog entry
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          awk -v tag="$TAG" '
+            index($0, "## [" tag "]") == 1 { in_section = 1; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-body.md
+          if [ ! -s release-body.md ]; then
+            echo "No changelog entry for $TAG yet." > release-body.md
+          fi
+          echo "Auto-built from \`${{ github.sha }}\`." >> release-body.md
+
       - name: Create / update GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Aether ${{ steps.version.outputs.tag }}
-          body: |
-            ## Aether ${{ steps.version.outputs.tag }}
-
-            Auto-built from `${{ github.sha }}`.
-
-            ### Platforms
-            | OS | Arch | Archive |
-            |---|---|---|
-            | macOS | ARM64 (Apple Silicon) | `Aether-macos-arm64.dmg` / `.zip` |
-            | macOS | x86_64 (Intel) | `Aether-macos-x86_64.dmg` / `.zip` |
-            | Linux | x86_64 | `Aether-linux-x86_64.AppImage` |
-            | Linux | aarch64 | `Aether-linux-aarch64.AppImage` |
-            | Windows | x86_64 | `Aether-windows-x86_64.zip` |
-
-            Open the `.dmg`, then drag **Aether.app** into **Applications**.
-
-            > **Note:** The macOS bundle is ad-hoc signed, not notarised —
-            > right-click → Open on first launch. Linux needs a
-            > StatusNotifierItem host (GNOME requires an AppIndicator
-            > extension); the AppImage falls back to `--no-tray` when none
-            > is found.
+          body_path: release-body.md
           files: |
             artifacts/**/*.zip
             artifacts/**/*.AppImage

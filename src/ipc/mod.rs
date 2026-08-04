@@ -125,8 +125,10 @@ mod tests {
                 socks_addr: "127.0.0.1:1819".into(),
                 connected_at_ms: 12,
             },
+            // TEST-NET-3 (RFC 5737): reserved for documentation, so nobody
+            // mistakes a fixture for a real tunnel endpoint.
             geo: Some(Box::new(crate::core::geo::GeoInfo {
-                ip: "104.28.246.164".into(),
+                ip: "203.0.113.10".into(),
                 ..Default::default()
             })),
         };
