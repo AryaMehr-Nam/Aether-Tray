@@ -82,10 +82,8 @@ jobs:
             g++-aarch64-linux-gnu
           # Tell Cargo which linker to use for the cross target.
           mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml <<TOML
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
-TOML
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
       # ── Windows cross-deps ─────────────────────────────────────────────
       - name: Install Windows ARM64 toolchain (cross)
