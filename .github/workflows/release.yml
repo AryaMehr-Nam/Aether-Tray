@@ -2,11 +2,15 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: write
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   package:
@@ -28,10 +32,20 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             aether_asset: aether-linux-x86_64.tar.gz
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            aether_asset: aether-linux-aarch64.tar.gz
+            cross: true
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             aether_asset: aether-windows-x86_64.zip
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            aether_asset: aether-windows-aarch64.zip
+            cross: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,17 +55,45 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Install Linux tray dependencies
-        if: runner.os == 'Linux'
+      # ── Linux native deps ──────────────────────────────────────────────
+      - name: Install Linux tray dependencies (native)
+        if: runner.os == 'Linux' && !matrix.cross
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
 
-      # AETHER_ASSET pins the core to the *target* arch, not the runner's —
-      # the macOS x86_64 build runs on an Intel runner but this keeps the
-      # pairing explicit and lets arm64 cross-build if the runner changes.
-      # `shell: bash` matters on Windows: the default there is PowerShell,
-      # and this is a bash script.
+      # Cross-compiling for aarch64 on an x86_64 runner needs the ARM
+      # versions of GTK and the appindicator library.
+      - name: Install Linux tray dependencies (cross aarch64)
+        if: runner.os == 'Linux' && matrix.cross
+        run: |
+          sudo dpkg --add-architecture arm64
+          # The GitHub Actions Ubuntu image mirrors are limited; add the
+          # ports mirror which carries the arm64 variants.
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list
+          echo \
+            "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" \
+            | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev:arm64 \
+            libayatana-appindicator3-dev:arm64 \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
+          # Tell Cargo which linker to use for the cross target.
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml <<TOML
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+TOML
+
+      # ── Windows cross-deps ─────────────────────────────────────────────
+      - name: Install Windows ARM64 toolchain (cross)
+        if: runner.os == 'Windows' && matrix.cross
+        run: rustup target add aarch64-pc-windows-msvc
+
+      # ── Fetch the Aether core ──────────────────────────────────────────
+      # AETHER_ASSET pins the core to the *target* arch, not the runner's.
       - name: Fetch the Aether core
         if: matrix.aether_asset != ''
         shell: bash
@@ -59,6 +101,16 @@ jobs:
           AETHER_ASSET: ${{ matrix.aether_asset }}
         run: ./binaries/fetch-aether.sh
 
+      # ── Build ──────────────────────────────────────────────────────────
+      - name: Build (cross)
+        if: matrix.cross
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # ── Package ────────────────────────────────────────────────────────
       - name: Package (macOS)
         if: runner.os == 'macOS'
         env:
@@ -69,11 +121,26 @@ jobs:
           # -y preserves the symlinks inside a .app bundle.
           zip -ry "Aether-${{ matrix.name }}.zip" Aether.app
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+      - name: Package (Linux native)
+        if: runner.os == 'Linux' && !matrix.cross
         env:
           TARGET: ${{ matrix.target }}
         run: |
+          sudo apt-get install -y libfuse2
+          curl -fsSL -o /usr/local/bin/appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          sudo chmod +x /usr/local/bin/appimagetool
+          ./packaging/linux-appimage.sh
+
+      - name: Package (Linux cross aarch64)
+        if: runner.os == 'Linux' && matrix.cross
+        env:
+          TARGET: aarch64-unknown-linux-gnu
+          APPIMAGE_ARCH: aarch64
+        run: |
+          # appimagetool needs to be the arch-native one; the x86_64
+          # version in the repo can still produce ARM AppImages when
+          # pointed at the right AppDir — the format is arch-agnostic.
           sudo apt-get install -y libfuse2
           curl -fsSL -o /usr/local/bin/appimagetool \
             https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
@@ -92,26 +159,83 @@ jobs:
           path: |
             dist/*.zip
             dist/*.AppImage
+            dist/*.app
           if-no-files-found: error
 
+  # ── Create the release ──────────────────────────────────────────────────
   release:
     needs: package
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
+      - uses: actions/checkout@v4
+
+      # When triggered by a tag push the tag already exists; when triggered
+      # by a push to main we create a lightweight tag from the Cargo.toml
+      # version so that the release has a proper version identifier.
+      - name: Determine version tag
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+            TAG="v${VERSION}"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+
+            # Only create the tag if it doesn't already exist.
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git tag "$TAG"
+              git push origin "$TAG"
+            fi
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-          # Bundles are ad-hoc signed only, which Gatekeeper will still warn
-          # about — say so rather than letting users discover it.
-          body: |
-            Built by CI from ${{ github.ref_name }}.
 
-            The macOS bundle is ad-hoc signed, not notarised: right-click →
-            Open on first launch. Linux needs a StatusNotifierItem host
-            (GNOME requires an AppIndicator extension) — the AppImage falls
-            back to `--no-tray` when none is found.
-          draft: true
+      - name: Collect release files
+        id: files
+        run: |
+          # Flatten all uploaded artifacts into a single list.
+          find artifacts -type f \( -name '*.zip' -o -name '*.AppImage' \) \
+            | sort > release_files.txt
+          echo "--- Release files ---"
+          cat release_files.txt
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Aether ${{ steps.version.outputs.tag }}
+          body: |
+            ## Aether ${{ steps.version.outputs.tag }}
+
+            Auto-built from `${{ github.sha }}`.
+
+            ### Platforms
+            | OS | Arch | Archive |
+            |---|---|---|
+            | macOS | ARM64 (Apple Silicon) | `Aether-macos-arm64.zip` |
+            | macOS | x86_64 (Intel) | `Aether-macos-x86_64.zip` |
+            | Linux | x86_64 | `Aether-linux-x86_64.AppImage` |
+            | Linux | aarch64 | `Aether-linux-aarch64.AppImage` |
+            | Windows | x86_64 | `Aether-windows-x86_64.zip` |
+            | Windows | aarch64 | `Aether-windows-aarch64.zip` |
+
+            > **Note:** The macOS bundle is ad-hoc signed, not notarised —
+            > right-click → Open on first launch. Linux needs a
+            > StatusNotifierItem host (GNOME requires an AppIndicator
+            > extension); the AppImage falls back to `--no-tray` when none
+            > is found.
+            >
+            > Windows ARM64 builds are cross-compiled and may require
+            > additional ARM64 runtime libraries on older Windows versions.
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.AppImage
+          draft: false
+          prerelease: false
