@@ -1,3 +1,6 @@
+// Prevent a console window from appearing on Windows — this is a tray-only app.
+#![windows_subsystem = "windows"]
+
 mod autostart;
 mod config;
 mod core;

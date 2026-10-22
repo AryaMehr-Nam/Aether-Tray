@@ -5,4 +5,8 @@
 *.zip
 SHA256SUMS.txt
 .DS_Store
+Thumbs.db
 /dist
+.idea/
+.vscode/
+*.log

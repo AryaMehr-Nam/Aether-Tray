@@ -9,7 +9,7 @@
 ![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
-[![Release](https://github.com/rendinjast/aether-tray/actions/workflows/release.yml/badge.svg)](https://github.com/rendinjast/aether-tray/actions/workflows/release.yml)
+[![Release](https://github.com/AryaMehr-Nam/Aether-Tray/actions/workflows/release.yml/badge.svg)](https://github.com/AryaMehr-Nam/Aether-Tray/actions/workflows/release.yml)
 
 </td>
 <td align="center">
@@ -61,7 +61,7 @@ curl --socks5 127.0.0.1:1819 https://cloudflare.com/cdn-cgi/trace
 ## Installation
 
 Download the installer for your platform from the
-[Releases](https://github.com/rendinjast/aether-tray/releases) page:
+[Releases](https://github.com/AryaMehr-Nam/Aether-Tray/releases) page:
 
 | Platform              | Artifact                           |
 | --------------------- | ---------------------------------- |

@@ -5,7 +5,9 @@ edition = "2024"
 authors = ["Aether Project"]
 license = "AGPL-3.0-or-later"
 description = "Tray-only native client for the Aether censorship-circumvention tool"
-repository = "https://github.com/CluvexStudio/aether-tray"
+repository = "https://github.com/AryaMehr-Nam/Aether-Tray"
+keywords = ["tray", "warp", "socks5", "proxy", "cloudflare"]
+categories = ["network-programming", "gui"]
 
 [dependencies]
 tray-icon = "0.19"
